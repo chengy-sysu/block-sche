@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "block-sche"
+version = "0.1.0"
+description = "Persistent CUDA kernel framework with software block-to-SM scheduling."
+requires-python = ">=3.9"
+
+[tool.setuptools]
+packages = ["block_sche", "block_sche.compiler"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
