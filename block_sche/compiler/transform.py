@@ -98,19 +98,20 @@ def _find_kernel(source: str, kernel_name: Optional[str]) -> Kernel:
 
 
 def _find_kernels(source: str, kernel_name: Optional[str]) -> List[Kernel]:
-    pattern = re.compile(
-        rf"(?P<prefix>(?:(?:template\s*<[^;{{}}]*>\s*)|(?:extern\s+\"C\"\s+))*)"
-        rf"(?P<qualifiers>(?:__global__|extern\s+\"C\"\s+__global__|__launch_bounds__\s*\([^)]*\)\s*__global__|__global__\s+__launch_bounds__\s*\([^)]*\))[\w\s\*:&<>,~]*?)"
-        rf"\b(?P<name>{_IDENT})\s*\(",
-        re.MULTILINE,
-    )
-
+    code_mask = _code_position_mask(source)
     matches = []
-    for match in pattern.finditer(source):
-        name = match.group("name")
+    for global_match in re.finditer(r"\b__global__\b", source):
+        global_pos = global_match.start()
+        if not code_mask[global_pos]:
+            continue
+
+        prefix_start, template_prefix, qualifier_start = _kernel_prefix(source, global_pos)
+        parsed = _parse_kernel_signature_after_global(source, global_match.end())
+        if parsed is None:
+            continue
+        name, params_start = parsed
         if kernel_name is not None and name != kernel_name:
             continue
-        params_start = match.end() - 1
         params_end = _find_matching(source, params_start, "(", ")")
         body_start = _skip_ws(source, params_end + 1)
         if body_start >= len(source) or source[body_start] != "{":
@@ -118,20 +119,145 @@ def _find_kernels(source: str, kernel_name: Optional[str]) -> List[Kernel]:
         body_end = _find_matching(source, body_start, "{", "}")
         matches.append(
             Kernel(
-                prefix_start=match.start("prefix"),
-                signature_start=match.start("qualifiers"),
+                prefix_start=prefix_start,
+                signature_start=qualifier_start,
                 params_start=params_start,
                 params_end=params_end,
                 body_start=body_start,
                 body_end=body_end,
-                template_prefix=match.group("prefix"),
-                qualifier_prefix=match.group("qualifiers"),
+                template_prefix=template_prefix,
+                qualifier_prefix=source[qualifier_start:params_start],
                 name=name,
                 params=source[params_start + 1 : params_end],
                 body=source[body_start + 1 : body_end],
             )
         )
     return matches
+
+
+def _kernel_prefix(source: str, global_pos: int) -> tuple[int, str, int]:
+    line_start = source.rfind("\n", 0, global_pos) + 1
+    qualifier_start = _find_leading_launch_bounds_start(source, global_pos)
+    if qualifier_start is None:
+        qualifier_start = _skip_inline_ws_forward(source, line_start)
+    prefix_start = qualifier_start
+
+    template_range = _find_template_prefix_range(source, qualifier_start)
+    if template_range is not None:
+        template_start, template_end = template_range
+        prefix_start = template_start
+        return prefix_start, source[template_start:template_end], qualifier_start
+
+    extern_start = _find_extern_c_prefix_start(source, qualifier_start)
+    if extern_start is not None:
+        prefix_start = extern_start
+        return prefix_start, source[prefix_start:qualifier_start], qualifier_start
+
+    return prefix_start, "", qualifier_start
+
+
+def _find_leading_launch_bounds_start(source: str, global_pos: int) -> Optional[int]:
+    before_global = _skip_ws_backward(source, global_pos)
+    attr_start = source.rfind("__launch_bounds__", 0, before_global)
+    if attr_start == -1:
+        return None
+    call_start = _skip_ws(source, attr_start + len("__launch_bounds__"))
+    if call_start >= len(source) or source[call_start] != "(":
+        return None
+    call_end = _find_matching(source, call_start, "(", ")")
+    if _skip_ws(source, call_end + 1) == global_pos:
+        return attr_start
+    return None
+
+
+def _find_template_prefix_range(source: str, qualifier_start: int) -> Optional[tuple[int, int]]:
+    i = qualifier_start
+    while True:
+        i = _skip_ws_backward(source, i)
+        start = source.rfind("template", 0, i)
+        if start == -1:
+            return None
+        if not _is_word_at(source, start, "template"):
+            i = start
+            continue
+        lt = _skip_ws(source, start + len("template"))
+        if lt < qualifier_start and source[lt] == "<":
+            end = _find_matching(source, lt, "<", ">")
+            prefix_end = _skip_ws(source, end + 1)
+            if end < qualifier_start and not source[prefix_end:qualifier_start].strip():
+                return start, prefix_end
+        i = start
+
+
+def _find_extern_c_prefix_start(source: str, qualifier_start: int) -> Optional[int]:
+    line_start = source.rfind("\n", 0, qualifier_start) + 1
+    candidate = _skip_inline_ws_forward(source, line_start)
+    if source.startswith('extern "C"', candidate):
+        return candidate
+    return None
+
+
+def _parse_kernel_signature_after_global(source: str, start: int) -> Optional[tuple[str, int]]:
+    i = start
+    while i < len(source):
+        i = _skip_ws(source, i)
+        if source.startswith("__launch_bounds__", i):
+            i = _skip_attribute_call(source, i + len("__launch_bounds__"))
+            continue
+        if source.startswith("__host__", i) or source.startswith("__device__", i):
+            i = _skip_identifier(source, i)
+            continue
+        if source.startswith("void", i) and _is_word_at(source, i, "void"):
+            i += len("void")
+            continue
+        name_match = re.match(_IDENT, source[i:])
+        if name_match is None:
+            return None
+        name = name_match.group(0)
+        if name == "__launch_bounds__":
+            i = _skip_attribute_call(source, i + len(name))
+            continue
+        i += len(name)
+        i = _skip_ws(source, i)
+        if i < len(source) and source[i] == "(":
+            return name, i
+        return None
+    return None
+
+
+def _skip_attribute_call(source: str, start: int) -> int:
+    i = _skip_ws(source, start)
+    if i < len(source) and source[i] == "(":
+        return _find_matching(source, i, "(", ")") + 1
+    return i
+
+
+def _skip_identifier(source: str, start: int) -> int:
+    match = re.match(_IDENT, source[start:])
+    return start + len(match.group(0)) if match else start
+
+
+def _is_word_at(source: str, start: int, word: str) -> bool:
+    if not source.startswith(word, start):
+        return False
+    before = source[start - 1] if start > 0 else ""
+    after_pos = start + len(word)
+    after = source[after_pos] if after_pos < len(source) else ""
+    return not (before.isalnum() or before == "_") and not (after.isalnum() or after == "_")
+
+
+def _skip_inline_ws_forward(source: str, start: int) -> int:
+    i = start
+    while i < len(source) and source[i] in " \t\r":
+        i += 1
+    return i
+
+
+def _skip_ws_backward(source: str, end: int) -> int:
+    i = end
+    while i > 0 and source[i - 1].isspace():
+        i -= 1
+    return i
 
 
 def _drop_kernel_definitions(source: str, kernels: Sequence[Kernel]) -> str:
@@ -148,6 +274,8 @@ def _emit_kernel_artifacts(kernel: Kernel, options: TransformOptions) -> str:
     _validate_kernel_body(kernel.body, kernel.name)
     persistent_name = options.output_kernel_name or f"{kernel.name}_persistent"
     device_name = f"{kernel.name}_rtask"
+    launch_bounds = _kernel_launch_bounds(kernel)
+    launch_bounds_suffix = f" {launch_bounds}" if launch_bounds else ""
 
     params = _split_params(kernel.params)
     param_names = [_param_name(param) for param in params if param.strip() and param.strip() != "void"]
@@ -233,7 +361,7 @@ def _emit_kernel_artifacts(kernel: Kernel, options: TransformOptions) -> str:
         )
     persistent_kernel = (
         f"{kernel.template_prefix}"
-        f"__global__ void {persistent_name}({persistent_params}) "
+        f"__global__ void{launch_bounds_suffix} {persistent_name}({persistent_params}) "
         "{\n"
         f"{persistent_body}"
         "}\n"
@@ -252,6 +380,17 @@ def _emit_kernel_artifacts(kernel: Kernel, options: TransformOptions) -> str:
     return "\n".join(parts)
 
 
+def _kernel_launch_bounds(kernel: Kernel) -> str:
+    attr_start = kernel.qualifier_prefix.find("__launch_bounds__")
+    if attr_start == -1:
+        return ""
+    call_start = _skip_ws(kernel.qualifier_prefix, attr_start + len("__launch_bounds__"))
+    if call_start >= len(kernel.qualifier_prefix) or kernel.qualifier_prefix[call_start] != "(":
+        return ""
+    call_end = _find_matching(kernel.qualifier_prefix, call_start, "(", ")")
+    return kernel.qualifier_prefix[attr_start : call_end + 1].strip()
+
+
 def _validate_kernel_body(body: str, kernel_name: str) -> None:
     unsupported = {
         "cooperative_groups::this_grid": "cooperative grid synchronization is not preserved by rTask conversion",
@@ -259,8 +398,65 @@ def _validate_kernel_body(body: str, kernel_name: str) -> None:
         "<<<": "device-side CUDA launches are not rewritten",
     }
     for needle, reason in unsupported.items():
-        if needle in body:
+        if _contains_code_token(body, needle):
             raise TransformError(f"kernel {kernel_name!r} is unsupported: {reason}")
+
+
+def _code_position_mask(source: str) -> List[bool]:
+    mask = [False] * len(source)
+    i = 0
+    state = "code"
+    while i < len(source):
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < len(source) else ""
+
+        if state == "line_comment":
+            if ch == "\n":
+                mask[i] = True
+                state = "code"
+        elif state == "block_comment":
+            if ch == "*" and nxt == "/":
+                i += 1
+                state = "code"
+        elif state == "string":
+            if ch == "\\":
+                i += 1
+            elif ch == '"':
+                state = "code"
+        elif state == "char":
+            if ch == "\\":
+                i += 1
+            elif ch == "'":
+                state = "code"
+        else:
+            if ch == "/" and nxt == "/":
+                i += 1
+                state = "line_comment"
+            elif ch == "/" and nxt == "*":
+                i += 1
+                state = "block_comment"
+            elif ch == '"':
+                mask[i] = True
+                state = "string"
+            elif ch == "'":
+                mask[i] = True
+                state = "char"
+            else:
+                mask[i] = True
+        i += 1
+    return mask
+
+
+def _contains_code_token(source: str, needle: str) -> bool:
+    mask = _code_position_mask(source)
+    start = 0
+    while True:
+        pos = source.find(needle, start)
+        if pos == -1:
+            return False
+        if pos < len(mask) and mask[pos]:
+            return True
+        start = pos + 1
 
 
 def _find_matching(source: str, start: int, open_ch: str, close_ch: str) -> int:

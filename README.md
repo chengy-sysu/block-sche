@@ -221,11 +221,12 @@ trace.download(&block_to_observed_sm);
 ## Current Limitations
 
 The compiler can transform one named kernel or every kernel in a file with
-`--all`. It expects concrete `__global__` kernels with ordinary parameter lists,
-including templated kernels. It virtualizes `blockIdx` and `gridDim` in the
-generated rTask body, but it does not yet handle kernels with complex
-macro-generated signatures, cooperative grid synchronization, or device-side
-CUDA launches.
+`--all`. It expects concrete `__global__` kernels, including templated kernels,
+dependent type parameters such as `typename Config::T*`, and common
+`__launch_bounds__` placements used by modern Ampere examples. It virtualizes
+`blockIdx` and `gridDim` in the generated rTask body, but it does not yet handle
+kernels with complex macro-generated signatures, cooperative grid
+synchronization, or device-side CUDA launches.
 
 This keeps the first implementation suitable for NNFusion-style generated CUDA
 while leaving room for a Clang LibTooling frontend later.
@@ -286,6 +287,10 @@ ctest --test-dir /tmp/block_sche_build --output-on-failure
 `vector_add_e2e` generates a persistent kernel from `examples/vector_add.cu`,
 builds it with the runtime API, and launches it when a CUDA device is available.
 `vector_add_sm_affine_e2e` additionally generates with `--sm-affine --trace`
-and verifies that every logical block was executed on its requested SM. On
-machines without a visible CUDA device, CTest marks those runtime tests as
-skipped.
+and verifies that every logical block was executed on its requested SM.
+When a `LeetCUDA/` checkout exists at the repository root,
+`leetcuda_elementwise_e2e` and `leetcuda_sgemm_e2e` extract real kernels from
+`LeetCUDA/kernels/elementwise/elementwise.cu` and
+`LeetCUDA/kernels/sgemm/sgemm.cu`, run them through the src2src compiler, and
+validate the generated persistent kernels on GPU. On machines without a visible
+CUDA device, CTest marks those runtime tests as skipped.

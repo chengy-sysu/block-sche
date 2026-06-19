@@ -136,6 +136,100 @@ __global__ void scale(T* y, T a) {
     assert "template <typename T>\n__global__ void scale_persistent" in generated
 
 
+def test_transform_supports_leetcuda_launch_bounds_after_void():
+    source = """
+template <const int MMA_M = 16, const int MMA_N = 8,
+          const int MMA_K = 16>
+__global__ void __launch_bounds__(256)
+    hgemm_ampere_kernel(half* A, half* B, half* C, int M, int N, int K) {
+  const int bx = blockIdx.x;
+  const int by = blockIdx.y;
+  const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+  if (bx < M && by < N && tid < blockDim.x) {
+    C[by * N + bx] = A[tid] + B[tid];
+  }
+}
+"""
+
+    generated = transform_cuda_source(
+        source, TransformOptions(kernel_name="hgemm_ampere_kernel")
+    )
+
+    assert "template <const int MMA_M = 16, const int MMA_N = 8,\n          const int MMA_K = 16>\n__device__ __forceinline__ void hgemm_ampere_kernel_rtask" in generated
+    assert "__global__ void __launch_bounds__(256) hgemm_ampere_kernel_persistent" in generated
+    assert "const int bx = blockIdx.x;" in generated
+    assert "const int by = blockIdx.y;" in generated
+
+
+def test_transform_supports_leetcuda_launch_bounds_before_global():
+    source = """
+template <const int kHeadDim, const int kMmaTileSeqLenQ>
+__launch_bounds__(32 * kMmaTileSeqLenQ)
+__global__ void flash_attn_ampere_kernel(half* Q, half* K, half* V,
+                                         half* O, int N) {
+  extern __shared__ half smem[];
+  const int lane = threadIdx.x % 32;
+  const int row = blockIdx.x;
+  if (row < gridDim.x && lane < kHeadDim) {
+    smem[lane] = Q[row * kHeadDim + lane] + K[lane] + V[lane];
+    O[row * kHeadDim + lane] = smem[lane];
+  }
+}
+"""
+
+    generated = transform_cuda_source(
+        source, TransformOptions(kernel_name="flash_attn_ampere_kernel")
+    )
+
+    assert "template <const int kHeadDim, const int kMmaTileSeqLenQ>\n__device__ __forceinline__ void flash_attn_ampere_kernel_rtask" in generated
+    assert "__global__ void __launch_bounds__(32 * kMmaTileSeqLenQ) flash_attn_ampere_kernel_persistent" in generated
+    assert "extern __shared__ half smem[];" in generated
+    assert "const int row = blockIdx.x;" in generated
+    assert "row < gridDim.x" in generated
+
+
+def test_transform_supports_dependent_type_parameters():
+    source = """
+template <typename FlashAttnConfig_>
+__global__ void flash_attn_cute_kernel(typename FlashAttnConfig_::T* pQ,
+                                       typename FlashAttnConfig_::T* pK,
+                                       typename FlashAttnConfig_::T* pO,
+                                       int N) {
+  using T = typename FlashAttnConfig_::T;
+  const int offset = blockIdx.x * blockDim.x + threadIdx.x;
+  if (offset < N) {
+    pO[offset] = static_cast<T>(pQ[offset] + pK[offset]);
+  }
+}
+"""
+
+    generated = transform_cuda_source(
+        source, TransformOptions(kernel_name="flash_attn_cute_kernel")
+    )
+
+    assert "typename FlashAttnConfig_::T* pQ" in generated
+    assert "typename FlashAttnConfig_::T* pK" in generated
+    assert "typename FlashAttnConfig_::T* pO" in generated
+    assert "flash_attn_cute_kernel_rtask(__bs_task, __bs_schedule, pQ, pK, pO, N);" in generated
+
+
+def test_transform_ignores_commented_kernel_and_launch_syntax():
+    source = """
+// __global__ void disabled(float* y) {
+//   child<<<1, 1>>>(y);
+// }
+__global__ void active(float* y) {
+  // child<<<1, 1>>>(y);
+  y[blockIdx.x] = gridDim.x;
+}
+"""
+
+    generated = transform_cuda_source(source, TransformOptions(kernel_name="active"))
+
+    assert "__device__ __forceinline__ void active_rtask" in generated
+    assert "disabled_persistent" not in generated
+
+
 def test_transform_rejects_unsupported_dynamic_parallelism():
     source = """
 __global__ void parent(float* y) {
